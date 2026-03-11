@@ -1,125 +1,54 @@
 import os
+import time
 import telebot
 import pdfplumber
 from google import genai
+from google.genai.errors import ClientError
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 # ---------- Config ----------
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8761170089:AAF3dOFS9BftYErhtUYiwdcbujkUBzhzgEs')
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', 'AIzaSyAjjGymZwdXjr1TW1ssmQBhdK255gSpZ9E')
 
-# New Google GenAI client
-client = genai.Client(api_key=GEMINI_API_KEY)
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+# Multiple Gemini API keys for rotation
+GEMINI_KEYS = [
+        os.environ.get('GEMINI_API_KEY_1', 'AIzaSyAjjGymZwdXjr1TW1ssmQBhdK255gSpZ9E'),
+            os.environ.get('GEMINI_API_KEY_2', ''),
+                os.environ.get('GEMINI_API_KEY_3', ''),
+]
+GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
 
-# ---------- Translation ----------
-def translate_text(text):
-    if not text or len(text.strip()) < 3:
-        return ''
-    prompt = (
-        "You are an expert academic translator. "
-        "Translate the following scientific text from English to Arabic contextually. "
-        "Return only the Arabic translation, nothing else:\n\n" + text
-    )
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=prompt
-        )
-        return response.text.strip()
-    except Exception as e:
-        print(f"[Translation Error]: {e}")
-        return '[خطأ في الترجمة]'
+current_key_index = 0
 
-# ---------- DOCX Processing ----------
-def process_docx(input_path, output_path):
-    doc = Document(input_path)
-    new_doc = Document()
-    for para in doc.paragraphs:
-        if para.text.strip():
-            # Original English paragraph
-            new_doc.add_paragraph(para.text)
-            # Arabic translation directly below
-            ar = translate_text(para.text)
-            ar_para = new_doc.add_paragraph(ar)
-            ar_para.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-            new_doc.add_paragraph('')
-    new_doc.save(output_path)
+def get_client():
+        return genai.Client(api_key=GEMINI_KEYS[current_key_index])
 
-# ---------- PDF Processing ----------
-def process_pdf(input_path, output_path):
-    new_doc = Document()
-    with pdfplumber.open(input_path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                for block in text.split('\n\n'):
-                    clean = block.replace('\n', ' ').strip()
-                    if clean:
-                        # Original English
-                        new_doc.add_paragraph(clean)
-                        # Arabic translation
-                        ar = translate_text(clean)
-                        ar_para = new_doc.add_paragraph(ar)
-                        ar_para.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-                        new_doc.add_paragraph('')
-    new_doc.save(output_path)
+        bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
-# ---------- Handlers ----------
-@bot.message_handler(commands=['start', 'help'])
-def welcome(message):
-    bot.reply_to(
-        message,
-        "مرحباً! 👋\n\n"
-        "أنا بوت الترجمة الأكاديمية العلمية.\n"
-        "أرسل لي ملف *PDF* أو *DOCX* باللغة الإنجليزية،\n"
-        "وسأرسل لك ملف Word يحتوي على:\n"
-        "• النص الإنجليزي الأصلي\n"
-        "• الترجمة العربية أسفله مباشرة ✅",
-        parse_mode='Markdown'
-    )
+        def translate_text(text):
+                global current_key_index
+                    if not text or len(text.strip()) < 3:
+                                return ''
+                                    prompt = (
+                                                "You are an expert academic translator. "
+                                                        "Translate the following scientific text from English to Arabic contextually. "
+                                                                "Return only the Arabic translation, nothing else:\n\n" + text
+                                    )
+                                        for attempt in range(len(GEMINI_KEYS) * 2):
+                                                    try:
+                                                                    client = get_client()
+                                                                                response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
+                                                                                            return response.text.strip()
+                                                                                                    except ClientError as e:
+                                                                                                                    if '429' in str(e) or 'RESOURCE_EXHAUSTED' in str(e):
+                                                                                                                                        current_key_index = (current_key_index + 1) % len(GEMINI_KEYS)
+                                                                                                                                                        time.sleep(2)
+                                                                                                                                                                    else:
+                                                                                                                                                                                        return '[Translation Error]'
+                                                                                                                                                                                                except Exception as e:
+                                                                                                                                                                                                                time.sleep(3)
+                                                                                                                                                                                                                    return '[Quota Exceeded]'
 
-@bot.message_handler(content_types=['document'])
-def handle_docs(message):
-    file_name = message.document.file_name
-    file_ext = os.path.splitext(file_name)[1].lower()
-
-    if file_ext not in ['.pdf', '.docx']:
-        bot.reply_to(message, "⚠️ الملف غير مدعوم. يرجى إرسال ملف PDF أو DOCX فقط.")
-        return
-
-    bot.reply_to(message, "⚡ جاري المعالجة والترجمة... يرجى الانتظار.")
-
-    try:
-        file_info = bot.get_file(message.document.file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-
-        tmp_input = f"in_{message.chat.id}{file_ext}"
-        tmp_output = f"out_{message.chat.id}.docx"
-
-        with open(tmp_input, 'wb') as f:
-            f.write(downloaded_file)
-
-        if file_ext == '.docx':
-            process_docx(tmp_input, tmp_output)
-        elif file_ext == '.pdf':
-            process_pdf(tmp_input, tmp_output)
-
-        with open(tmp_output, 'rb') as f:
-            bot.send_document(
-                message.chat.id, f,
-                caption="✅ تمت الترجمة بنجاح!"
-            )
-
-        os.remove(tmp_input)
-        os.remove(tmp_output)
-
-    except Exception as e:
-        bot.reply_to(message, f"❌ حدث خطأ: {str(e)}")
-        print(f"[Error]: {e}")
-
-# ---------- Start ----------
-if __name__ == '__main__':
-    print("✅ Bot is running...")
-    bot.infinity_polling()
+                                                                                                                                                                                                                    def process_do
+                                    )
+]
